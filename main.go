@@ -1,7 +1,12 @@
 package main
 
 import (
+	"os"
+	"os/signal"
+	"syscall"
+
 	"github.com/WingkaiHo/kube-ingress-external-dns/ingress"
+	"github.com/golang/glog"
 )
 
 func main() {
@@ -9,5 +14,21 @@ func main() {
 	helper.LoadIngress()
 	helper.UpdateIngressController()
 	helper.OuputHostFile()
-	helper.WatchIngressChange()
+
+	stopWatchIngress := helper.WatchIngressChange()
+	stopWatchController, err := helper.WatchIngressControllerUpdate()
+
+	// Fail to get nginx controller pod event watcher
+	if err != nil {
+		glog.Errorln(err)
+		return
+	}
+
+	signalChan := make(chan os.Signal)
+	signal.Notify(signalChan, os.Interrupt, os.Kill, syscall.SIGUSR1, syscall.SIGUSR2)
+	s := <-signalChan
+	glog.Infoln("Exit by single: ", s)
+	// 结束Ingress/nginx controller 监控
+	stopWatchIngress <- struct{}{}
+	stopWatchController <- struct{}{}
 }
