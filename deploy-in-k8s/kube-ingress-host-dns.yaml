@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingress-host-dns
+  namespace: kube-system
+  labels:
+    kubernetes.io/cluster-service: "true"
+    addonmanager.kubernetes.io/mode: Reconcile
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingress-host-dns
+  namespace: kube-system
+data:
+#upstream dns of ingress host dns
+  resolv.dnsmasq.conf: |
+    nameserver 114.114.114.114
+#write you private domain here
+  private.dnsmasq.hosts: |
+#192.168.0.1 you.app.domain
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: ingress-host-dns
+  namespace: kube-system
+  labels:
+    k8s-app: heapster
+    kubernetes.io/cluster-service: "true"
+    addonmanager.kubernetes.io/mode: Reconcile
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: ingress-host-dns
+      version: v1.0
+  template:
+    metadata:
+      labels:
+        k8s-app: ingress-host-dns
+        version: v1.0
+      annotations:
+        scheduler.alpha.kubernetes.io/critical-pod: ''
+    spec:
+      containers:
+        - image: 192.168.11.30:5000/ingress-host-dns:1.0-centos
+          name: kube-ingress-dns
+          command:
+            - kube-ingress-external-dns
+          args:
+            - -alsologtostderr=true
+            - -hosfilePath=/etc/dnsmasq.host/ingress.host
+            - -run_in_k8s_cluster=true
+          volumeMounts:
+          - name: hostsdir
+            mountPath: /etc/dnsmasq.host/ 
+          resources:
+            requests:
+              cpu: 150m
+              memory: 20Mi
+            limits:
+              cpu: 500m
+              memory: 100Mi 
+        - name: dnsmasq
+          image: 192.168.11.30:5000/gcr.io/google_containers/k8s-dns-dnsmasq-nanny-amd64:1.14.2
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+          - name: hostsdir
+            mountPath: /etc/dnsmasq.host/
+          - name: resolv-conf
+            mountPath: /etc/dnsmasq.host/resolv.dnsmasq.conf
+            subPath: resolv.dnsmasq.conf 
+          - name: hosts-conf
+            mountPath: /etc/dnsmasq.host/private.dnsmasq.hosts
+            subPath: private.dnsmasq.hosts
+          resources:
+            requests:
+              cpu: 100m
+              memory: 70Mi
+            limits:
+              cpu: 500m
+              memory: 170Mi 
+          args:
+          - -v=2
+          - -logtostderr
+          - -configDir=/etc/dnsmasq.host/
+          - -restartDnsmasq=true
+          - --
+          - -k
+          - --cache-size=1000
+          - --log-facility=-
+          - --user=root
+          - --no-hosts
+          - --strict-order
+          - --resolv-file=/etc/dnsmasq.host/resolv.dnsmasq.conf
+          - --hostsdir=/etc/dnsmasq.host/
+          ports:
+          - containerPort: 53
+            name: dns
+            protocol: UDP
+          - containerPort: 53
+            name: dns-tcp
+            protocol: TCP
+      volumes:
+      - name: hostsdir
+        emptyDir: {}
+      - name: resolv-conf 
+        configMap:
+          name: ingress-host-dns
+          items:
+          - key: resolv.dnsmasq.conf
+            path: resolv.dnsmasq.conf
+      - name: hosts-conf
+        configMap:
+          name: ingress-host-dns
+          items:
+          - key: private.dnsmasq.hosts
+            path: private.dnsmasq.hosts
+      serviceAccountName: ingress-host-dns
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-host-dns
+  namespace: kube-system
+  labels:
+    k8s-app: ingress-host-dns
+spec:
+  selector:
+    k8s-app: ingress-host-dns
+  clusterIP: 10.233.0.4
+  ports:
+  - name: dns
+    port: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+
