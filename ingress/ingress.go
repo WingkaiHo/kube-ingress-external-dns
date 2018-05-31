@@ -9,11 +9,12 @@ import (
 
 	"github.com/golang/glog"
 
+	"github.com/WingkaiHo/kube-ingress-external-dns/safemap"
 	corev1 "k8s.io/api/core/v1"
 	v1beta1 "k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/types"
+	//	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
@@ -27,9 +28,9 @@ var isInCluster = flag.Bool("run_in_k8s_cluster", false, "The app run in k8s clu
 
 type IngressHostHelper struct {
 	k8sClient   *kubernetes.Clientset
-	ingressMap  map[types.UID]v1beta1.Ingress
+	ingressMap  safemap.SafeMap
 	hosfilePath string
-	controllers map[string]corev1.Pod
+	controllers safemap.SafeMap
 	m           *sync.Mutex
 }
 
@@ -42,8 +43,8 @@ func NewIngressHostHelper() (helper *IngressHostHelper) {
 	var err error
 
 	helper = new(IngressHostHelper)
-	helper.ingressMap = make(map[types.UID]v1beta1.Ingress, 10)
-	helper.controllers = make(map[string]corev1.Pod, 3)
+	helper.ingressMap = safemap.New()
+	helper.controllers = safemap.New()
 	helper.hosfilePath = *hosfilePath
 	helper.m = new(sync.Mutex)
 
@@ -79,7 +80,7 @@ func (helper *IngressHostHelper) LoadIngress() {
 	for i := range ingresses.Items {
 		glog.Infoln("Load ingress item:", ingresses.Items[i].Name)
 		id := ingresses.Items[i].UID
-		helper.ingressMap[id] = ingresses.Items[i]
+		helper.ingressMap.Insert(string(id), ingresses.Items[i])
 	}
 }
 
@@ -102,20 +103,17 @@ func (helper *IngressHostHelper) WatchIngressControllerUpdate() (chan<- struct{}
 					pod, ok := obj.(*corev1.Pod)
 					update := false
 					if ok {
-						helper.m.Lock()
 						if event.Type == watch.Deleted {
 							glog.Info("Delete nginx controller: ", pod.Status.HostIP)
-							delete(helper.controllers, pod.Status.HostIP)
+							helper.controllers.Delete(pod.Status.HostIP)
 							update = true
 						} else {
-							if _, persent := helper.controllers[pod.Status.HostIP]; persent == false {
-								helper.controllers[pod.Status.HostIP] = *pod
+							if _, persent := helper.controllers.Find(pod.Status.HostIP); persent == false {
+								helper.controllers.Insert(pod.Status.HostIP, *pod)
 								glog.Info("Add nginx controller: ", pod.Status.HostIP)
 								update = true
 							}
 						}
-						helper.m.Unlock()
-
 						if update {
 							helper.OuputHostFile()
 						}
@@ -138,8 +136,9 @@ func (helper *IngressHostHelper) UpdateIngressController() {
 	}
 
 	for i := range pods.Items {
-		helper.controllers[pods.Items[i].Status.HostIP] = pods.Items[i]
-		glog.Infoln("Add nginx controller:", helper.controllers[pods.Items[i].Status.HostIP].Status.HostIP)
+		//helper.controllers[pods.Items[i].Status.HostIP] = pods.Items[i]
+		helper.controllers.Insert(pods.Items[i].Status.HostIP, pods.Items[i])
+		glog.Infoln("Add nginx controller:", pods.Items[i].Status.HostIP)
 	}
 
 }
@@ -149,24 +148,48 @@ func (helper *IngressHostHelper) OutputHostItem(buf *bytes.Buffer, ip, domain st
 	buf.WriteString(s)
 }
 
+func MakeDumpIngressHostFunc(helper *IngressHostHelper) func(map[string]interface{}) []interface{} {
+	return func(store map[string]interface{}) []interface{} {
+		output := make([]interface{}, 0)
+		for _, value := range store {
+			ingress := value.(v1beta1.Ingress)
+			for i := range ingress.Spec.Rules {
+				output = append(output, ingress.Spec.Rules[i].Host)
+			}
+		}
+		return output
+	}
+}
+
+func MakeDumpIngressIpFunc(helper *IngressHostHelper) func(map[string]interface{}) []interface{} {
+	return func(store map[string]interface{}) []interface{} {
+		output := make([]interface{}, 0)
+		for _, value := range store {
+			pod := value.(corev1.Pod)
+			output = append(output, pod.Status.HostIP)
+		}
+		return output
+	}
+}
+
 func (helper *IngressHostHelper) OuputHostFile() {
 	var buf bytes.Buffer
 
-	// lock
-	helper.m.Lock()
-	defer helper.m.Unlock()
+	vhosts := helper.ingressMap.Dump(MakeDumpIngressHostFunc(helper))
+	ips := helper.controllers.Dump(MakeDumpIngressIpFunc(helper))
 
-	for _, ingress := range helper.ingressMap {
-		// if exists loadbalance ip user load balance ip
-		for _, pod := range helper.controllers {
-			for j := range ingress.Spec.Rules {
-				helper.OutputHostItem(&buf, pod.Status.HostIP, ingress.Spec.Rules[j].Host)
-			}
+	fmt.Println(vhosts)
+	fmt.Print(ips)
+	for _, host := range vhosts {
+		for _, ip := range ips {
+			helper.OutputHostItem(&buf, ip.(string), host.(string))
 		}
 	}
 
+	fmt.Println(buf.String())
 	f, err := os.Create(helper.hosfilePath)
 	if err != nil {
+		fmt.Println(err, f)
 		return
 	}
 
@@ -185,12 +208,9 @@ func (helper *IngressHostHelper) WatchIngressChange() chan<- struct{} {
 		AddFunc: func(obj interface{}) {
 			ing, ok := obj.(*v1beta1.Ingress)
 			if ok {
-				if _, present := helper.ingressMap[ing.UID]; !present {
-					helper.m.Lock()
+				if _, present := helper.ingressMap.Find(string(ing.UID)); !present {
 					glog.Info("Add ingress item:", *ing)
-					helper.ingressMap[ing.UID] = *ing
-					helper.m.Unlock()
-					// Update hostfile
+					helper.ingressMap.Insert(string(ing.UID), *ing)
 					helper.OuputHostFile()
 				}
 			}
@@ -199,12 +219,7 @@ func (helper *IngressHostHelper) WatchIngressChange() chan<- struct{} {
 			ing, ok := obj.(*v1beta1.Ingress)
 			if ok {
 				glog.Info("Delete ingress item:", *ing)
-
-				helper.m.Lock()
-				delete(helper.ingressMap, ing.UID)
-				helper.m.Unlock()
-
-				// update hostfile
+				helper.ingressMap.Delete(string(ing.UID))
 				helper.OuputHostFile()
 			}
 
@@ -215,9 +230,7 @@ func (helper *IngressHostHelper) WatchIngressChange() chan<- struct{} {
 			if ok1 && ok2 {
 				glog.Info("Update ingress item:", *oldIng)
 
-				helper.m.Lock()
-				helper.ingressMap[oldIng.UID] = *curlIng
-				helper.m.Unlock()
+				helper.ingressMap.Insert(string(oldIng.UID), *curlIng)
 
 				// update hostfile
 				helper.OuputHostFile()
