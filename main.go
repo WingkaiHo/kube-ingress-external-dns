@@ -16,13 +16,7 @@ func main() {
 	helper.OuputHostFile()
 
 	stopWatchIngress := helper.WatchIngressChange()
-	stopWatchController, err := helper.WatchIngressControllerUpdate()
-
-	// Fail to get nginx controller pod event watcher
-	if err != nil {
-		glog.Errorln(err)
-		return
-	}
+	stopWatchController := helper.WatchIngressControllerChange()
 
 	signalChan := make(chan os.Signal)
 	signal.Notify(signalChan, os.Interrupt, os.Kill, syscall.SIGUSR1, syscall.SIGUSR2)
