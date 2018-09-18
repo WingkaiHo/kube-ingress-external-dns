@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"reflect"
 	"sync"
+	//"time"
 
 	"github.com/golang/glog"
 
@@ -25,6 +27,7 @@ import (
 var kubeConfig = flag.String("kubeconfig", "./config", "Path to a kube config. Only required if out-of-cluster.")
 var hosfilePath = flag.String("hosfilePath", "/etc/dnsmasq.d/ingress.host", "The hostfile path of dnsmsq to load hostfile")
 var isInCluster = flag.Bool("run_in_k8s_cluster", false, "The app run in k8s cluster")
+var ingressPodLable = flag.String("pod_lable", "k8s-app=ingress-nginx", "The pod lable of ingress controller")
 
 type IngressHostHelper struct {
 	k8sClient   *kubernetes.Clientset
@@ -73,7 +76,7 @@ func NewIngressHostHelper() (helper *IngressHostHelper) {
 func (helper *IngressHostHelper) LoadIngress() {
 	ingresses, err := helper.k8sClient.ExtensionsV1beta1().Ingresses(metav1.NamespaceAll).List(metav1.ListOptions{})
 	if err != nil {
-		fmt.Println(err)
+		//glog.
 		return
 	}
 
@@ -84,11 +87,49 @@ func (helper *IngressHostHelper) LoadIngress() {
 	}
 }
 
-func (helper *IngressHostHelper) WatchIngressControllerUpdate() (chan<- struct{}, error) {
-	opts := metav1.ListOptions{LabelSelector: "app=ingress-nginx"}
+func getIngressControllerPodEventInterface(helper *IngressHostHelper, label string) (watch.Interface, error) {
+	opts := metav1.ListOptions{LabelSelector: label}
 	eventInterface, err := helper.k8sClient.CoreV1().Pods(metav1.NamespaceAll).Watch(opts)
+	if err != nil {
+		glog.Info("event interface err: ", err.Error())
+		return nil, err
+	}
+	glog.Info("Connect k8s master successful.")
+	return eventInterface, nil
+}
+
+func processControllerPodEvent(helper *IngressHostHelper, event watch.Event) {
+	if event.Type == watch.Added || event.Type == watch.Deleted {
+		obj := event.Object.DeepCopyObject()
+		pod, ok := obj.(*corev1.Pod)
+		update := false
+		if ok {
+			if event.Type == watch.Deleted {
+				glog.Info("Delete nginx controller: ", pod.Status.HostIP)
+				helper.controllers.Delete(pod.Status.HostIP)
+				update = true
+			} else {
+				if _, persent := helper.controllers.Find(pod.Status.HostIP); persent == false {
+					helper.controllers.Insert(pod.Status.HostIP, *pod)
+					glog.Info("Add nginx controller: ", pod.Status.HostIP)
+					update = true
+				}
+			}
+
+			if update {
+				helper.OuputHostFile()
+			}
+		}
+	}
+
+}
+
+func (helper *IngressHostHelper) WatchIngressControllerUpdate() (chan<- struct{}, error) {
+	glog.Info("Start watch ingress controller ")
+	eventInterface, err := getIngressControllerPodEventInterface(helper, *ingressPodLable)
 	stop := make(chan struct{})
 	if err != nil {
+		glog.Info("event interface err: ", err.Error())
 		return stop, err
 	}
 
@@ -97,28 +138,17 @@ func (helper *IngressHostHelper) WatchIngressControllerUpdate() (chan<- struct{}
 			select {
 			case <-stop:
 				return
-			case event := <-eventInterface.ResultChan():
-				if event.Type == watch.Added || event.Type == watch.Deleted {
-					obj := event.Object.DeepCopyObject()
-					pod, ok := obj.(*corev1.Pod)
-					update := false
-					if ok {
-						if event.Type == watch.Deleted {
-							glog.Info("Delete nginx controller: ", pod.Status.HostIP)
-							helper.controllers.Delete(pod.Status.HostIP)
-							update = true
-						} else {
-							if _, persent := helper.controllers.Find(pod.Status.HostIP); persent == false {
-								helper.controllers.Insert(pod.Status.HostIP, *pod)
-								glog.Info("Add nginx controller: ", pod.Status.HostIP)
-								update = true
-							}
-						}
-						if update {
-							helper.OuputHostFile()
-						}
+			case event, normal := <-eventInterface.ResultChan():
+				if normal == false {
+					glog.Info("event interface close:")
+					eventInterface, err = getIngressControllerPodEventInterface(helper, *ingressPodLable)
+					if err != nil {
+						panic(err)
 					}
+				} else {
+					processControllerPodEvent(helper, event)
 				}
+
 			}
 		}
 	}()
@@ -128,7 +158,7 @@ func (helper *IngressHostHelper) WatchIngressControllerUpdate() (chan<- struct{}
 
 func (helper *IngressHostHelper) UpdateIngressController() {
 	pods, err := helper.k8sClient.CoreV1().Pods(metav1.NamespaceAll).List(
-		metav1.ListOptions{LabelSelector: "app=ingress-nginx"})
+		metav1.ListOptions{LabelSelector: "k8s-app=ingress-nginx"})
 
 	if err != nil {
 		fmt.Println(err)
@@ -178,8 +208,8 @@ func (helper *IngressHostHelper) OuputHostFile() {
 	vhosts := helper.ingressMap.Dump(MakeDumpIngressHostFunc(helper))
 	ips := helper.controllers.Dump(MakeDumpIngressIpFunc(helper))
 
-	fmt.Println(vhosts)
-	fmt.Print(ips)
+	glog.Infoln("Ingress domains:", vhosts)
+	glog.Infoln("Ingress nginx ips:", ips)
 	for _, host := range vhosts {
 		for _, ip := range ips {
 			helper.OutputHostItem(&buf, ip.(string), host.(string))
@@ -189,7 +219,7 @@ func (helper *IngressHostHelper) OuputHostFile() {
 	fmt.Println(buf.String())
 	f, err := os.Create(helper.hosfilePath)
 	if err != nil {
-		fmt.Println(err, f)
+		glog.Errorln(err, f)
 		return
 	}
 
@@ -226,11 +256,11 @@ func (helper *IngressHostHelper) WatchIngressChange() chan<- struct{} {
 		},
 		UpdateFunc: func(old, cur interface{}) {
 			oldIng, ok1 := old.(*v1beta1.Ingress)
-			curlIng, ok2 := cur.(*v1beta1.Ingress)
-			if ok1 && ok2 {
+			currIng, ok2 := cur.(*v1beta1.Ingress)
+			if ok1 && ok2 && !reflect.DeepEqual(oldIng, currIng) {
 				glog.Info("Update ingress item:", *oldIng)
 
-				helper.ingressMap.Insert(string(oldIng.UID), *curlIng)
+				helper.ingressMap.Insert(string(oldIng.UID), *currIng)
 
 				// update hostfile
 				helper.OuputHostFile()
@@ -244,7 +274,7 @@ func (helper *IngressHostHelper) WatchIngressChange() chan<- struct{} {
 	_, controller := cache.NewInformer(
 		watchlist,
 		&v1beta1.Ingress{},
-		//time.Second*100,
+		//time.Second*10,
 		0,
 		ingEventHandler)
 
