@@ -11,9 +11,13 @@ import (
 
 func main() {
 	helper := ingress.NewIngressHostHelper()
-	helper.LoadIngress()
-	helper.UpdateIngressController()
-	helper.OuputHostFile()
+	errLoadIgress := helper.LoadIngress()
+	errUpdateController := helper.UpdateIngressController()
+
+	// 解决启动时候 get pod 失败的导出空host表导致dns失败
+	if errLoadIgress == nil && errUpdateController == nil {
+		helper.OuputHostFile()
+	}
 
 	stopWatchIngress := helper.WatchIngressChange()
 	stopWatchController := helper.WatchIngressControllerChange()
