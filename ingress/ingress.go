@@ -27,8 +27,7 @@ var kubeConfig = flag.String("kubeconfig", "./config", "Path to a kube config. O
 var hosfilePath = flag.String("hosfilePath", "/etc/dnsmasq.d/ingress.host", "The hostfile path of dnsmsq to load hostfile")
 var isInCluster = flag.Bool("run_in_k8s_cluster", false, "The app run in k8s cluster")
 var ingressPodLable = flag.String("pod_lable", "k8s-app=ingress-nginx", "The pod lable of ingress controller")
-
-//var podNamespace = flag.String("namespace", "ingress-nginx", "The namespace of ingress controller")
+var podNamespace = flag.String("namespace", "ingress-nginx", "The namespace of ingress controller")
 
 type IngressHostHelper struct {
 	k8sClient   *kubernetes.Clientset
@@ -72,11 +71,11 @@ func NewIngressHostHelper() (helper *IngressHostHelper) {
 	return helper
 }
 
-func (helper *IngressHostHelper) LoadIngress() {
+func (helper *IngressHostHelper) LoadIngress() error {
 	ingresses, err := helper.k8sClient.ExtensionsV1beta1().Ingresses(metav1.NamespaceAll).List(metav1.ListOptions{})
 	if err != nil {
-		//glog.
-		return
+		glog.Errorln("Load ingress fail:", err.Error())
+		return err
 	}
 
 	for i := range ingresses.Items {
@@ -84,15 +83,16 @@ func (helper *IngressHostHelper) LoadIngress() {
 		id := ingresses.Items[i].UID
 		helper.ingressMap.Insert(string(id), ingresses.Items[i])
 	}
+	return nil
 }
 
-func (helper *IngressHostHelper) UpdateIngressController() {
-	pods, err := helper.k8sClient.CoreV1().Pods(metav1.NamespaceAll).List(
-		metav1.ListOptions{LabelSelector: "k8s-app=ingress-nginx"})
+func (helper *IngressHostHelper) UpdateIngressController() error {
+	pods, err := helper.k8sClient.CoreV1().Pods(*podNamespace).List(
+		metav1.ListOptions{LabelSelector: *ingressPodLable})
 
 	if err != nil {
-		fmt.Println(err)
-		return
+		glog.Errorln("Get ingress controller fail:", err.Error())
+		return err
 	}
 
 	for i := range pods.Items {
@@ -101,6 +101,7 @@ func (helper *IngressHostHelper) UpdateIngressController() {
 		glog.Infoln("Add nginx controller:", pods.Items[i].Status.HostIP)
 	}
 
+	return nil
 }
 
 func (helper *IngressHostHelper) OutputHostItem(buf *bytes.Buffer, ip, domain string) {
@@ -167,11 +168,22 @@ func (helper *IngressHostHelper) NewWatchIngressControllerList() *cache.ListWatc
 		options.FieldSelector = fields.Everything().String()
 	}
 	return cache.NewFilteredListWatchFromClient(helper.k8sClient.CoreV1().RESTClient(),
-		"pods", metav1.NamespaceAll, optionsModifier)
+		"pods", *podNamespace, optionsModifier)
 }
 
 func (helper *IngressHostHelper) WatchIngressControllerChange() chan<- struct{} {
 	podEventHandler := cache.ResourceEventHandlerFuncs{
+		// 添加 add 事件防止启动list controller pod 失败导致 controller列表为空
+		AddFunc: func(obj interface{}) {
+			pod, ok := obj.(*corev1.Pod)
+			if ok && pod.Status.HostIP != "" {
+				if _, present := helper.controllers.Find(pod.Status.HostIP); !present {
+					glog.Info("Add nginx controller: ", pod.Status.HostIP)
+					helper.controllers.Insert(pod.Status.HostIP, *pod)
+					helper.OuputHostFile()
+				}
+			}
+		},
 		UpdateFunc: func(old, cur interface{}) {
 			oPod, ok1 := old.(*corev1.Pod)
 			nPod, ok2 := cur.(*corev1.Pod)
@@ -183,7 +195,7 @@ func (helper *IngressHostHelper) WatchIngressControllerChange() chan<- struct{} 
 				}
 				// add new controller ip
 				if nPod.Status.HostIP != "" {
-					if _, persent := helper.controllers.Find(nPod.Status.HostIP); persent == false {
+					if _, persent := helper.controllers.Find(nPod.Status.HostIP); !persent {
 						helper.controllers.Insert(nPod.Status.HostIP, *nPod)
 						glog.Info("Add nginx controller: ", nPod.Status.HostIP)
 						helper.OuputHostFile()
